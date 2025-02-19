@@ -1,0 +1,1087 @@
+---
+title: "ST2195 Part 2"
+author: "carine"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#ST2195 Programming for Data Science 
+
+This Python analysis, conducted in a Jupyter Notebook, focuses on examining flight arrival and departure data for commercial flights operated by carriers within the USA from 1987 to 2007. We will specifically extract data for the years 1995 to 2004 to be used in our analysis.
+
+```{r}
+#Packages needed for analysis
+library(DBI)
+library(dplyr)
+library(RSQLite)
+library(ggplot2)
+library(ggthemes)
+library(cowplot)
+library(shiny)
+library(ggforce)
+library(GGally)
+library(scales)
+library(lubridate)  
+library(knitr)  
+library(kableExtra)
+library(reshape2)
+library(gridExtra)
+library(tidyverse)
+library(scales)
+library(tidyr)
+library(RColorBrewer)
+library(ROCR)
+library(recipes)
+library(caret)
+library(pROC)      
+library(gbm)       
+library(glmnet)    
+library(rpart)     
+
+#Packages for machine learning
+library(mlr3)
+library(mlr3learners)
+library(skimr)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(paradox)
+library(mlr3viz)
+library(ranger)
+```
+
+```{r}
+#Create a connection to SQLlite DBbrowser
+conn <- dbConnect(RSQLite::SQLite(), "ST2195.db")
+```
+
+```{r}
+#Utilise the 'read.csv' function to import CSV data files into R and ensure inclusion of headers by setting "header = TRUE".
+airports <- read.csv("airports.csv", header = TRUE)
+carriers <- read.csv("carriers.csv", header = TRUE)
+plane_data <- read.csv("plane-data.csv", header = TRUE)
+yeardata_1995 <- read.csv("1995.csv", header = TRUE)
+yeardata_1996 <- read.csv("1996.csv", header = TRUE)
+yeardata_1997 <- read.csv("1997.csv", header = TRUE)
+yeardata_1998 <- read.csv("1998.csv", header = TRUE)
+yeardata_1999 <- read.csv("1999.csv", header = TRUE)
+yeardata_2000 <- read.csv("2000.csv", header = TRUE)
+yeardata_2001 <- read.csv("2001.csv", header = TRUE)
+yeardata_2002 <- read.csv("2002.csv", header = TRUE)
+yeardata_2003 <- read.csv("2003.csv", header = TRUE)
+yeardata_2004 <- read.csv("2004.csv", header = TRUE)
+
+#Concatenate the data bases using 'planes'
+planes <- bind_rows(yeardata_1995, yeardata_1996, yeardata_1997, yeardata_1998, yeardata_1999, yeardata_2000, yeardata_2001, yeardata_2002, yeardata_2003, yeardata_2004)
+```
+
+```{r}
+#Utilise 'dbWriteTable' to create a data frame into a database table within DB Browser.
+dbWriteTable(conn, 'ontime' , planes, append = TRUE)
+
+#Total delays will be classified as 'Delays'
+planes$Delays <- planes$DepDelay + planes$ArrDelay
+```
+
+#a. What are the best times and days of the week to minimise delays each year?
+
+#a(i). What are the best times to minimise delays each year?
+```{r}
+#Establish the function to categorise time of day to bins
+timebin <- function(i) {
+  if (is.na(i)) {
+    return('Other')  #'Other' defined as invalid time entries or missing values
+  } else if (i >= 0 && i <= 600) {
+    return('Night')
+  } else if (i > 600 && i <= 1200) {
+    return('Morning')
+  } else if (i > 1200 && i <= 1800) {
+    return('Afternoon')
+  } else if (i > 1800 && i <= 2400) {
+    return('Evening')
+  } else {
+    return('Other')  #To counter any unexpected values
+  }
+}
+
+#Implement time binning logic to 'ArrTime' and 'DepTime' columns
+planes$arr_timebin <- sapply(planes$ArrTime, timebin)
+planes$dep_timebin <- sapply(planes$DepTime, timebin)
+
+#Choose relevant columns for analysis
+DayTime <- subset(planes, select = c("ArrTime", "CRSArrTime", "ArrDelay", "DepTime", "CRSDepTime", "DepDelay", "arr_timebin", "dep_timebin"))
+
+#Filter out 'Other' bins and remove NA values
+DayTime <- DayTime[!(DayTime$dep_timebin == "Other" | DayTime$arr_timebin == "Other"), ]
+DayTime <- na.omit(DayTime)
+
+#Print resulting dataframe
+DayTime #Ensure that all values are valid
+```
+
+We will now create a table summarising the total number of flights, the percentage of flights, the count of delayed flights, and the percentage of delayed flights by time of day.
+
+```{r}
+#Extract and summarise data on departure flights and delays by time of day
+DayTime_Dep <- DayTime %>%
+  group_by(dep_timebin) %>%
+  summarise(Flights = n()) %>%
+  rename(`Time of Day` = dep_timebin)
+
+#Extract and summarise data on arrival flights and delays by time of day
+DayTime_Arr <- DayTime %>%
+  group_by(arr_timebin) %>%
+  summarise(Flights = n()) %>%
+  rename(`Time of Day` = arr_timebin)
+
+#Merge departure and arrival flights into one dataframe
+DayTime_merged <- left_join(DayTime_Dep, DayTime_Arr, by = c("Time of Day" = "Time of Day")) %>%
+  mutate(Flights = coalesce(Flights.x, 0) + coalesce(Flights.y, 0)) %>%
+  select(-Flights.x, -Flights.y)
+
+#Create a column to represent departure delays
+DayTime_DepDelay <- DayTime %>%
+  filter(dep_timebin != 'Other', DepDelay > 0) %>%
+  group_by(dep_timebin) %>%
+  summarise(Delays = n()) %>%
+  rename(`Time of Day` = dep_timebin)
+
+#Create a column to represent arrival delays
+DayTime_ArrDelay <- DayTime %>%
+  filter(arr_timebin != 'Other', ArrDelay > 0) %>%
+  group_by(arr_timebin) %>%
+  summarise(Delays = n()) %>%
+  rename(`Time of Day` = arr_timebin)
+
+#Combine departure and arrival delays
+DayTime_mergedDelay <- left_join(DayTime_DepDelay, DayTime_ArrDelay, by = "Time of Day") %>%
+  mutate(Delays = coalesce(Delays.x, 0) + coalesce(Delays.y, 0)) %>%
+  select(-Delays.x, -Delays.y)
+
+#Merge all dataframes
+DayTime_df <- left_join(DayTime_merged, DayTime_mergedDelay, by = "Time of Day") %>%
+  mutate(`Percentage Delayed` = (Delays / Flights) * 100) %>%
+  arrange(`Percentage Delayed`)
+
+#Rename column headers
+DayTime_df <- DayTime_df %>%
+  select(`Time of Day`, Flights, Delays, `Percentage Delayed`)
+
+#Print resulting table
+DayTime_df %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+From the table, the 'Evening' period exhibited the highest percentage of delayed flights at 52.43%, while 'Morning' had the lowest delay rate at 33.47%.
+
+Interestingly, despite 'Morning' time period accommodating a higher total number of flights, exceeding 36 million, compared to 'Evening' with over 31 million flights during the period spanning from 1995 to 2004, 'Evening' still manifest a significantly higher delay percentage.
+
+We will now plot a bar graph showing the percentage of delayed flights by time of day.
+
+```{r}
+#Arrange Time of day in order
+DayTime_df$`Time of day` <- factor(DayTime_df$`Time of Day`, levels = c('Morning', 'Afternoon', 'Evening', 'Night'))
+
+#Plot bar graph
+DayTimePercentage <- ggplot(data = DayTime_df, aes(x = `Time of Day`, y = `Percentage Delayed`, fill = `Time of Day`)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = c(2, 6, 8, 4)) +
+  labs(title = 'Percentage Delayed by Time of Day', x = 'Time of Day', y = 'Percentage') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  geom_text(aes(label = paste0(round(`Percentage Delayed`, 2), '%')), position = position_dodge(width = 1), vjust = -0.5, size = 3)
+
+#Print resulting graph
+ggsave('DayTimePercentage.png', width = 10, height = 6)
+DayTimePercentage
+```
+
+The bar graph above illustrates the percentage of delayed flights categorised by different times of the day.
+
+We will now create a table summarising the average delay of flights by time of day.
+
+```{r}
+#Compute the average delay in arrival
+AvgDayTime_Arr <- DayTime %>%
+  group_by(arr_timebin) %>%
+  summarise(`Average Delay in Arrival` = mean(ArrDelay)) %>%
+  rename(`Time of Day` = arr_timebin)
+
+#Compute the average delay in departure
+AvgDayTime_Dep <- DayTime %>%
+  group_by(dep_timebin) %>%
+  summarise(`Average Delay in Departure` = mean(DepDelay)) %>%
+  rename(`Time of Day` = dep_timebin)
+
+#Merge and compute the total average delays
+AvgDayTime_merged <- left_join(AvgDayTime_Dep, AvgDayTime_Arr, by = "Time of Day") %>%
+  mutate(`Total Average Delays` = `Average Delay in Departure` + `Average Delay in Arrival`) %>%
+  arrange(`Total Average Delays`)
+
+#Print resulting table
+AvgDayTime_merged %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The table above highlights that 'Night' exhibits the highest total average delay of 50.69 minutes, while 'Morning' records a significantly lower figure of only 3.35 minutes.
+
+Interestingly, this finding diverges from the percentage of delayed flights, where 'Evening' experiences a total average delay of 28.44 minutes, positioning it just below 'Night', which has the highest total average delay of 50.69 minutes.
+
+We will now plot a bar graph showing the average delays of flights by time of 
+day.
+
+```{r}
+#Arrange time of day in order
+AvgDayTime_merged$`Time of Day` <- factor(AvgDayTime_merged$`Time of Day`, levels = c('Morning', 'Afternoon', 'Evening', 'Night'))
+
+#Plot bar graph
+DayTimeAverage <- ggplot(data = AvgDayTime_merged, aes(x = `Time of Day`, y = `Total Average Delays`, fill = `Time of Day`)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = c(2, 6, 8, 4)) + 
+  labs(title = 'Average delay by Time of Day', x = 'Time of Day', y = 'Minutes') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  geom_text(aes(label = round(`Total Average Delays`, 2)), position = position_dodge(width = 1), vjust = -0.5, size = 3)
+
+#Print resulting graph
+ggsave('DayTimeAverage.png', width = 10, height = 6)
+DayTimeAverage
+```
+
+The bar graph above illustrates the total average delay categorised by different times of the day.
+
+We will now plot a violin plot showing distribution of delays across years by time of day.
+
+```{r}
+#Prepare departure delay data
+DelaybyDayTime_Dep <- planes %>%
+  group_by(Year, dep_timebin) %>%
+  summarise(Delays = mean(Delays)) %>%
+  ungroup() 
+
+#Prepare arrival delay data
+DelaybyDayTime_Arr <- planes %>%
+  group_by(Year, arr_timebin) %>%
+  summarise(Delays = mean(Delays)) %>%
+  ungroup() 
+
+#Merge departure and arrival delay data into one dataframe
+DelaybyDayTime_Dep <- DelaybyDayTime_Dep %>%
+  rename(timebin = dep_timebin)
+DelaybyDayTime_Arr <- DelaybyDayTime_Arr %>%
+  rename(timebin = arr_timebin)
+DayTimeDelay <- bind_rows(DelaybyDayTime_Dep, DelaybyDayTime_Arr) %>%
+  na.omit()
+
+#Arrange time of day in order
+TimeOrder <- c('Morning', 'Afternoon', 'Evening', 'Night')
+DayTimeDelay$timebin <- factor(DayTimeDelay$timebin, levels = TimeOrder, ordered = TRUE)
+
+#Plot violin plot
+DayTimeViolin <- ggplot(DayTimeDelay, aes(x = timebin, y = Delays)) + 
+  geom_violin(aes(fill = timebin), trim = FALSE) + 
+  geom_boxplot(width = 0.1) +
+  labs(title = "Distribution of Delays Across Years by Time of Day",
+       x = "Time of Day",
+       y = "Average Delay (minutes)",
+       fill = "Time of Day") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5), 
+        legend.position = "right") +
+  scale_fill_manual(values = c(2, 6, 8, 4))
+
+#Print resulting violin plot
+ggsave("DayTimeViolin.png", width = 12, height = 8)
+DayTimeViolin
+```
+
+The violin plot above illustrates delay distributions across different times of day. Each violin shape represents the density distribution of delays during specific periods.
+
+'Morning' delays, depicted by a light pink violin, show a widening around 5 minutes of delay. 'Morning' has the lowest average delay among all times of day, peaking at approximately 15 minutes.
+
+'Afternoon' delays, depicted by a violet violin, widen around 20 minutes, indicating a higher frequency of delays during this time. 'Afternoon' ranks as the second lowest in average delay among all times of day, peaking at approximately 30 minutes.
+
+The grey 'Evening' violin plot is slightly thinner compared to the 'Morning' and 'Afternoon' violin plots. However, 'Evening' ranks as the second highest in average delay among all times of day, peaking at approximately 50 minutes.
+
+The blue 'Night' violin plot is tall and thin, with a long tail extending up to 120 minutes, highlighting the presence of outliers with significant delays. 'Night' is proven to have the worst average delays out of all times of day.
+
+Each violin plot features a box plot, with a black line representing the median. Overall, the plot reveals variations in delay frequency and severity across different times of day, with 'Night' showing potential for extreme delays and 'Morning' exhibiting the least variation in delay times.
+
+We will conclude our analysis on flight delays across different times of the day by visualising the average delay of flights spanning from 1995 to 2004 through a heatmap.
+
+```{r}
+#Prepare departure delay data
+DelaybyDayTime_dep <- planes %>%
+  group_by(Year, `Time of day` = dep_timebin) %>%
+  summarise(Delays = mean(as.numeric(Delays), na.rm = TRUE), .groups = 'drop')  
+
+#Prepare arrival delay data
+DelaybyDayTime_arr <- planes %>%
+  group_by(Year, `Time of day` = arr_timebin) %>%
+  summarise(Delays = mean(as.numeric(Delays), na.rm = TRUE), .groups = 'drop')
+
+#Merge departure and arrival delay data into one dataframe
+DayTimeDelay2 <- bind_rows(DelaybyDayTime_arr, DelaybyDayTime_dep)  
+DayTimeDelay2 <- DayTimeDelay2 %>%   
+  group_by(Year, `Time of day`) %>%   
+  mutate(AdjustedDelays = if_else(`Time of day` == "Night", min(Delays), max(Delays))) %>%
+  summarise(Delays = first(AdjustedDelays), .groups = 'drop')
+
+#Create a pivot table
+DayTimeDelay_pivot <- DayTimeDelay2 %>%
+  pivot_wider(names_from = Year, values_from = Delays)
+
+#Arrange time of day in order
+DayTimeDelay_pivot$`Time of day` <- factor(DayTimeDelay_pivot$`Time of day`, levels = c('Night', 'Evening', 'Afternoon', 'Morning'))
+
+#Convert wide format to long format
+DayTimeDelay_pivot_long <- DayTimeDelay_pivot %>%
+  pivot_longer(cols = -`Time of day`, names_to = "Year", values_to = "Delays")
+
+#Unnest the Delays column
+pivot_DelaybyDayTime_long <- DayTimeDelay_pivot_long %>%
+  unnest(cols = Delays) %>%
+  na.omit() 
+
+#Plot the heatmap 
+HeatmapDayTime <- ggplot(data = DayTimeDelay_pivot_long, aes(x = Year, y = `Time of day`, fill = Delays)) +   
+  geom_tile() +   
+  scale_fill_gradient(name = "Average Delay (minutes)", low = "gold", high = "darkred", na.value = "white", limits = c(0, max(DayTimeDelay_pivot_long$Delays, na.rm = TRUE)), breaks = seq(0, max(DayTimeDelay_pivot_long$Delays, na.rm = TRUE), by = 10), labels = scales::comma) +   
+  labs(title = "Average Delay Across Years by Time of day", x = "Year", y = "Time of day") +   
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),          
+        plot.title = element_text(hjust = 0.5)) +     
+  geom_text(aes(label = ifelse(is.na(Delays), "", sprintf("%.2f", Delays))), vjust = -0.5, color = "white", size = 3) +     
+  scale_x_discrete(breaks = levels(factor(DayTimeDelay_pivot_long$Year))) +     
+  guides(fill = guide_colorbar(title = "Average Delay (minutes)"))
+
+#Print resulting heatmap
+ggsave("HeatmapDayTime.png", width = 12, height = 8)
+HeatmapDayTime
+```
+
+The heatmap above highlights significant trends: Evening periods consistently exhibit high average delays, with the highest delay recorded in 2000 at 41.76 minutes, while Morning periods consistently maintain low average delays, with the highest delay observed in 1996 at 8.92 minutes. 
+
+In conclusion, our analysis employing bar graphs, violin plots, and heatmaps suggests that 'Morning' (6 a.m. to 12 p.m.) is the optimal time to minimise delays each year, followed by 'Afternoon' (12 p.m. to 6 p.m.). 
+
+To mitigate delays, it is advisable to avoid scheduling flights during 'Evening' (6 p.m. to 12 a.m.) and 'Night' (12 a.m. to 6 a.m.) periods. These insights provide actionable recommendations for scheduling flights to optimise on-time performance and minimise delays.
+
+
+#a(ii). What are the best days of the week to minimise delays each year?
+```{r}
+#Eliminate rows that have null values in the 'DayOfWeek' column
+clean_planes <- planes[!is.na(planes$DayOfWeek), ]
+
+#Define a function to map numerical values to their corresponding day of the week
+map_day <- function(DayOfWeek) {
+  Day <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+  return(Day[DayOfWeek])
+}
+
+#Utilise the map_day function on 'DayOfWeek' column
+planes$DayOfWeek <- sapply(planes$DayOfWeek, map_day)
+```
+
+We will now create a table summarising the total number of flights, the percentage of flights, the count of delayed flights, and the percentage of delayed flights by day of week.
+
+```{r}
+#Compute the percentage of flights for each day
+DayWeekFlights <- planes %>%
+  group_by(DayOfWeek) %>%
+  summarise(Flights = n()) %>%
+  mutate(Total_Flights = sum(Flights),
+         `Percentage of Flights` = (Flights / Total_Flights) * 100)
+
+#Total delays by Day of Week
+DayWeekDelays <- planes %>%
+  filter(DepDelay > 0 | ArrDelay > 0) %>%
+  group_by(DayOfWeek) %>%
+  summarise(Delays = n())
+
+#Merge dataframes
+DayWeekTotal <- inner_join(DayWeekFlights, DayWeekDelays, by = 'DayOfWeek')
+
+#Compute the percentage of flights delayed
+DayWeekTotal <- DayWeekTotal %>%
+  mutate(`Percentage Delayed` = (Delays / Flights) * 100) %>%
+  arrange(`Percentage Delayed`) #Sort dataframe by Percentage Delayed
+
+#Rename column headers
+DayWeekTotal <- DayWeekTotal %>%
+  select(DayOfWeek, Flights, `Percentage of Flights`, Delays, `Percentage Delayed`)%>%
+  rename(`Day of Week` = DayOfWeek)
+
+#Print resulting table
+DayWeekTotal %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The table above reveals that 'Friday' consistently experiences the highest percentage of delayed flights at 59.96%, contrasting with the lowest delay percentage of 51.14% on 'Saturday'. Notably, 'Friday' also boasts a substantial volume of flights, ranking fourth with a frequency of 14.64%, while 'Saturday' records the lowest flight frequency at 12.87%.
+
+We will now plot a bar graph showing the percentage of delayed flights by day of week.
+
+```{r}
+#Arrange Day of Week in order
+day_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+#Apply 'day_order' to dataframe
+DayWeekTotal$`Day of Week` <- factor(DayWeekTotal$`Day of Week`, levels = day_order)
+
+#Plot bar graph
+DayWeekPercentage <- ggplot(data = DayWeekTotal, aes(x = `Day of Week`, y = `Percentage Delayed`, fill = `Day of Week`)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(8, 2, 3, 4, 5, 6, 7)) +
+  labs(title = "Percentage of delays by day of week", x = "Day of Week", y = "Percentage") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(label = round(`Percentage Delayed`, 2)), position = position_dodge(width = 1), vjust = -0.5, size = 3) +
+  ylim(0, 62)
+
+#Print the resulting graph
+ggsave("DayWeekPercentage.png", width = 12, height = 8)
+DayWeekPercentage
+```
+
+The bar graph above illustrates the percentage of delayed flights categorised by different days of the week.
+
+We will now create a table summarising the average delay of flights by day of week.
+
+```{r}
+#Create dataframe with average delay values
+AvgDayWeek <- planes %>%
+  select(DayOfWeek, DepDelay, ArrDelay) %>%
+  group_by(DayOfWeek) %>%
+  summarise(`Average Departure Delay` = mean(DepDelay, na.rm = TRUE),
+            `Average Arrival Delay` = mean(ArrDelay, na.rm = TRUE)) %>%
+  mutate(`Average delay` = (`Average Departure Delay` + `Average Arrival Delay`) / 2,
+         `Total Average Delay` = `Average Departure Delay` + `Average Arrival Delay`) %>%
+  arrange(`Total Average Delay`)  #Sort by Total Average Delay in ascending order
+
+#Rename column headers
+AvgDayWeek <- AvgDayWeek %>%
+  rename(`Day of Week` = DayOfWeek)
+
+#Print resulting table
+AvgDayWeek %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The data underscores 'Friday' as the most delay-prone day of the week, corroborated by the total average delay. 'Friday' ranks lowest, exhibiting the highest total average delay of 20.07 minutes, whereas 'Saturday' claims the top spot with the least total average delay of 10.93 minutes.
+
+We will now plot a bar graph showing the average delay of flights by day of week.
+
+```{r}
+#Arrange day of week in order
+AvgDayWeek$`Day of Week` <- factor(AvgDayWeek$`Day of Week`, levels = day_order)
+
+#Plot bar graph
+DayWeekAvg <- ggplot(data = AvgDayWeek, aes(x = `Day of Week`, y = `Total Average Delay`, fill = `Day of Week`)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c(8, 2, 3, 4, 5, 6, 7)) +  
+  labs(title = "Average Delay by day of week (minutes)", x = "Day of Week", y = "Minutes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  geom_text(aes(label = round(`Total Average Delay`, 2)), position = position_dodge(width = 1), vjust = -0.5, size = 3) +
+  ylim(0, 22)
+
+#Print resulting graph
+ggsave("DayWeekAverage.png", plot = DayWeekAvg, width = 12, height = 8)
+DayWeekAvg
+```
+
+The bar graph above illustrates the total average delay categorised by different days of the week.
+
+We will now plot a violin plot showing distribution of delays across years by day of week.
+
+```{r}
+#Convert 'DayOfWeek' to categorical data type with specified order
+planes$`Day of Week` <- factor(planes$DayOfWeek, levels = c('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'), ordered = TRUE)
+
+#Compute the average delay for each year and day of the week 
+DelaybyDayWeek <- planes %>%
+  group_by(Year, `Day of Week`) %>%
+  summarise(Delays = mean(Delays, na.rm = TRUE)) %>%
+  ungroup() %>%
+  na.omit()
+
+#Create a pivot table for the violin plot
+DelaybyDayWeek_pivot <- DelaybyDayWeek %>%
+  pivot_wider(names_from = `Day of Week`, values_from = Delays)
+
+#Plot the violin plot
+DayWeekViolin <- ggplot(DelaybyDayWeek, aes(x = `Day of Week`, y = Delays)) + 
+  geom_violin(aes(fill = `Day of Week`), trim = FALSE) + 
+  geom_boxplot(width = 0.1) +
+  labs(title = "Distribution of Delays Across Years by Day of Week",
+       x = "Day of Week",
+       y = "Average Delay (minutes)",
+       fill = "Day of Week") +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5), 
+        legend.position = "right") +
+  scale_fill_manual(values = c(8, 2, 3, 4, 5, 6, 7)) 
+
+#Print resulting plot
+ggsave('DayWeekViolin.png', width = 12, height = 8)
+DayWeekViolin
+```
+
+The violin plot above illustrates delay distributions across different day of the week. Each violin shape represents the density distribution of delays during specific periods.
+
+'Monday', 'Tuesday', and 'Wednesday' violins have a similar plot and an approximately similar highest average delay of between 23 to 25 minutes.
+
+The most notable would be the cyan 'Friday' violin plot. It has the thinnest and tallest plot, suggesting a presence of outliers with significant delays, with the highest average delay of approximately 37 minutes.
+
+Conversely, the violet 'Saturday' violin plot has the lowest average delay of approximately 20 minutes, widening around 10 to 15 minutes.
+
+Each violin plot features a box plot, with a black line representing the median. Overall, the plot reveals variations in delay frequency and severity across different times of day, with 'Friday' showing potential for extreme delays and 'Saturday' exhibiting the least variation in delay times.
+
+We will conclude our analysis on flight delays across different days of the week by visualising the average delay of flights spanning from 1995 to 2004 through a heatmap.
+
+```{r}
+#Convert 'DayOfWeek' to categorical data type with specified order
+planes$`Day of Week` <- factor(planes$DayOfWeek, levels = c('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'), ordered = TRUE)
+
+#Compute the average delay for each year and day of the week 
+DelaybyDayWeek <- planes %>%
+  group_by(Year, `Day of Week`) %>%
+  summarise(Delays = mean(Delays, na.rm = TRUE)) %>%
+  ungroup() %>%
+  na.omit()
+
+#Create a pivot table for the heatmap
+pivot_DelaybyDayWeek2 <- DelaybyDayWeek %>%
+  pivot_wider(names_from = Year, values_from = Delays)
+
+#Arrange days of the week in order
+pivot_DelaybyDayWeek2$`Day of Week` <- factor(pivot_DelaybyDayWeek2$`Day of Week`, levels = c('Sunday', 'Saturday', 'Friday', 'Thursday', 'Wednesday', 'Tuesday', 'Monday'))
+
+#Convert wide format to long format
+pivot_DelaybyDayWeek2_long <- pivot_DelaybyDayWeek2 %>%
+  pivot_longer(cols = -`Day of Week`, names_to = "Year", values_to = "Delays")
+
+#Unnest the Delays column
+pivot_DelaybyDayWeek2_long <- pivot_DelaybyDayWeek2_long %>%
+  unnest(cols = Delays)
+
+#Plot the heatmap
+HeatmapDayWeek <- ggplot(data = pivot_DelaybyDayWeek2_long , aes(x = factor(Year), y = `Day of Week`, fill = Delays)) +
+  geom_tile() +
+  scale_fill_gradient(name = "Average Delay (minutes)", low = "gold", high = "darkred", na.value = "white", limits = c(0, max(pivot_DelaybyDayWeek2_long$Delays, na.rm = TRUE)), breaks = seq(0, max(pivot_DelaybyDayWeek2_long$Delays, na.rm = TRUE), by = 10), labels = scales::comma) +
+  labs(title = "Average Delay Across Years by Day of Week", x = "Year", y = "Day of Week") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+   plot.title = element_text(hjust = 0.5)) +  
+  geom_text(aes(label = ifelse(is.na(Delays), "", round(Delays, 2))), vjust = -0.5, color = "white", size = 3) +  
+  scale_x_discrete(breaks = levels(factor(pivot_DelaybyDayWeek2_long $Year))) +  # Use scale_x_discrete for categorical data
+  guides(fill = guide_colorbar(title = "Average Delay (minutes)"))
+
+#Print resulting heatmap
+ggsave("HeatmapDayWeek.png", width = 12, height = 8)
+HeatmapDayWeek
+```
+
+The heatmap above illustrates the average delay across years by days of the week. In 2000, 'Friday' experienced the most significant delay, reaching an average of 30.81 minutes.
+
+Conversely, lighter colours indicate lower average delays, notably on 'Saturday', with its lowest average delays observed in 2002 and 2003 of 4.22 minutes and 4.34 minutes respectively. 
+
+In conclusion, our analysis employing bar graphs, violin plots, and heatmaps suggests that 'Saturday' is the most optimal day to minimise delays each year.
+
+To mitigate delays, it is advisable to avoid scheduling many flights on 'Friday'. These insights provide actionable recommendations for scheduling flights to optimise on-time performance and minimise delays.
+
+
+#b. Evaluate whether older planes suffer more delays on year-to-year basis
+```{r}
+#Subset 'plane_data' DataFrame to include only needed columns and rename them
+planedata_subset <- plane_data %>%
+  select(tailnum = tailnum, year)
+
+#Merge 'planes' dataframe with 'plane_data' dataframe using Tail Number
+airplanes <- left_join(planes, planedata_subset, by = c('TailNum' = 'tailnum'))
+
+#Exclude rows where year information is missing
+airplanes <- airplanes[!is.na(airplanes$year), ]
+
+#Rename the 'year' column from 'plane_data' dataframe to 'PlaneYear' to avoid confusion
+names(airplanes)[names(airplanes) == "year"] <- "PlaneYear"
+
+#Print the resulting dataframe
+print(airplanes)
+```
+
+An airplanes is classified as old once it has surpassed 21 years since its initial construction. (Paramount Business Jets, n.d.)
+
+We will now classify airplanes as either "old" or "new" depending on their manufacturing year
+
+```{r}
+#Convert 'Year' and 'PlaneYear' columns to integers
+airplanes$Year <- as.integer(airplanes$Year)
+airplanes$PlaneYear <- as.integer(airplanes$PlaneYear)
+
+#Calculate the age of each plane using the year data from the CSV files
+airplanes$PlaneAge <- airplanes$Year - airplanes$PlaneYear
+
+#Define bins and labels for old and new planes
+bins <- c(0, 21, Inf)  #21 years is the threshold for old planes
+labels <- c("New", "Old")
+
+#Categorise planes based on age
+airplanes$PlaneAgeCategory <- cut(airplanes$PlaneAge, breaks = bins, labels = labels)
+
+#Introduce a boolean column for flight delays, assigning 1 to denote delayed flights and 0 for punctual ones, determined by departure and arrival delay assessments.
+airplanes$Delayed_Boolean <- as.integer((airplanes$DepDelay > 0) | (airplanes$ArrDelay > 0))
+
+#Select relevant columns
+airplanes_bin <- airplanes[, c("PlaneAge", "PlaneYear", "Delayed_Boolean", "ArrDelay", "DepDelay", "PlaneAgeCategory")]
+airplanes_bin
+```
+
+```{r}
+#Filter out rows with invalid PlaneYear values and set the maximum PlaneYear to 2004, since the dataset only covers the years from 1995 to 2004.
+airplanes_bin <- airplanes[(airplanes$PlaneYear > 1900) & (airplanes$PlaneYear <= 2004), ]
+
+#Print oldest and newest plane manufacture year
+oldest_manuyear <- min(airplanes_bin$PlaneYear, na.rm = TRUE)
+newest_manuyear <- max(airplanes_bin$PlaneYear, na.rm = TRUE)
+print(paste("Oldest Manufacturing Year:", as.integer(oldest_manuyear)))
+print(paste("Oldest Manufacturing Year:", as.integer(newest_manuyear)))
+
+#Print the oldest and newest plane ages (PlaneAge)
+oldest_planeage <- max(airplanes_bin$PlaneAge, na.rm = TRUE)
+newest_planeage <- min(airplanes_bin$PlaneAge, na.rm = TRUE)
+print(paste("Oldest Plane Age:", as.integer(oldest_planeage)))
+print(paste("Newest Plane Age:", as.integer(newest_planeage)))
+```
+
+Considering that a negative Plane Age lacks validity, our approach will set the newest plane age to zero.
+
+```{r}
+#Replace negative PlaneAge values with zero
+airplanes_bin$PlaneAge <- pmax(airplanes_bin$PlaneAge, 0)
+
+#Print the oldest and newest plane ages (PlaneAge)
+oldest_planeage <- max(airplanes_bin$PlaneAge, na.rm = TRUE)
+newest_planeage <- min(airplanes_bin$PlaneAge, na.rm = TRUE)
+print(paste("Oldest Plane Age:", as.integer(oldest_planeage)))
+print(paste("Newest Plane Age:", as.integer(newest_planeage)))
+```
+
+The aircraft manufacturing dates range from 1956, the earliest, to 2004 (since the imported dataset only covers the years from 1995 to 2004), the most recent. The oldest plane in operation is 48 years old, whereas the newest planes are freshly flown, at 0 years old.
+
+```{r}
+#Number of new and old planes
+table(airplanes_bin$PlaneAgeCategory)
+```
+
+We will now create a table summarising the total number of flights, the percentage of flights, the count of delayed flights, and the percentage of delayed flights by 'PlaneAgeCategory' by day of week.
+
+```{r}
+#Compute count of flights per age category
+Percentage_airplanes <- airplanes_bin %>%
+  filter(!is.na(PlaneAgeCategory)) %>% 
+  group_by(PlaneAgeCategory) %>%
+  summarise(Flights = n())
+
+#Compute sum of the delayed flights and total delays per age category.
+Total_airplanes <- airplanes_bin %>%
+  filter(!is.na(PlaneAgeCategory)) %>%
+  group_by(PlaneAgeCategory) %>%
+  summarise(`Total Delays` = sum(Delayed_Boolean, na.rm = TRUE))  #Remove all NA values
+
+#Merge dataframes
+PercentageTotal_airplanes <- inner_join(Percentage_airplanes, Total_airplanes, by = "PlaneAgeCategory")
+
+#Compute the percentage of total flights for each age category.
+total_flights <- sum(PercentageTotal_airplanes$Flights)
+PercentageTotal_airplanes$`Percentage of Flights` <- (PercentageTotal_airplanes$Flights / total_flights) * 100
+
+#Compute the percentage of delayed flights for each age category.
+PercentageTotal_airplanes$`Percentage Delayed` <- (PercentageTotal_airplanes$`Total Delays` / PercentageTotal_airplanes$Flights) * 100
+
+#Sort the values based on the percentage of delayed flights in ascending order.
+PercentageTotal_airplanes <- PercentageTotal_airplanes[order(PercentageTotal_airplanes$`Percentage Delayed`), ]
+
+#Rename column headers
+names(PercentageTotal_airplanes)[names(PercentageTotal_airplanes) == "PlaneAgeCategory"] <- "Plane Age Category"
+
+#Print the resulting table
+PercentageTotal_airplanes <- PercentageTotal_airplanes[, c("Plane Age Category", "Flights", "Percentage of Flights", "Total Delays", "Percentage Delayed")]
+PercentageTotal_airplanes %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The table above highlights a significant trend: New planes (aged 0 to 21 years) contribute to a higher proportion of delayed flights, representing 57.16% of delays among all New planes, compared to Old planes (aged 21 years and above), which contribute to 47.69% of delays among all Old planes.
+
+However, it's essential to interpret this observation considering the discrepancy in the number of flights operated by each category. New planes, totaling 19,366,539 flights, represent 94.11% of all flights, while Old planes, totaling 1,211,233 flights, represent only 5.89% of all flights.
+
+Despite this discrepancy, the total number of delays varies significantly between the two categories. New planes experienced a total of 11,070,781 delays, while Old planes had a total of 577,685 delays.
+
+We will now plot a bar graph showing the percentage of delayed flights for old and new planes.
+
+```{r}
+#Convert Plane Age Category to categorical type with correct order
+PercentageTotal_airplanes$`Plane Age Category` <- factor(PercentageTotal_airplanes$`Plane Age Category`, levels = c("Old", "New"), ordered = TRUE)
+PercentageTotal_airplanes <- PercentageTotal_airplanes[order(PercentageTotal_airplanes$`Plane Age Category`), ]
+
+
+#Plot bar graph
+PercentageAirplanes <- ggplot(data = PercentageTotal_airplanes, aes(x = `Plane Age Category`, y = `Percentage Delayed`, fill = `Plane Age Category`)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Percentage of Delayed Flights for Old and New Planes",
+       x = "Plane Age Category",
+       y = "Percentage") +
+  scale_fill_manual(values = c("Old" = 2, "New" = 4)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(label = paste(round(`Percentage Delayed`, 2), "%")), vjust = -0.5, size = 3.5) +
+  ylim(0, 60)
+
+#Print resulting graph
+ggsave("PercentageAirplanes.png", width = 10, height = 6)
+PercentageAirplanes
+```
+
+The bar graph above illustrates the percentage of delayed flights categorised by plane age (New/Old).
+
+We will now create a table summarising the average delay of flights by 'Plane Age Category'.
+
+```{r}
+#Compute average departure and arrival delays and total average delay
+Avg_airplanes <- airplanes_bin %>%
+  filter(!is.na(PlaneAgeCategory)) %>%
+  group_by(PlaneAgeCategory) %>%
+  summarise(`Average Departure Delay` = mean(DepDelay, na.rm = TRUE),
+            `Average Arrival Delay` = mean(ArrDelay, na.rm = TRUE)) %>%
+  mutate(`Total average delay` = `Average Departure Delay` + `Average Arrival Delay`) %>%
+  arrange(`Total average delay`)
+
+#Rename columns headers
+colnames(Avg_airplanes) <- c('Plane Age Category', 'Average Departure Delay', 'Average Arrival Delay', 'Total average delay')
+
+#Print resulting table
+Avg_airplanes %>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The table above reveals that New planes (aged 0 to 21 years) exhibit a slightly higher total average delay of 14.54 minutes compared to Old planes (aged 21 years and above), which have an average delay of 10.48 minutes.
+
+Furthermore, New planes demonstrate slightly higher average departure and arrival delays compared to Old planes. Along with the percentage of delayed flights for both Old and New planes, it appears that Old planes do not significantly contribute to flight delays.
+
+We will now plot a bar graph showing the average delay of flights by 'Plane Age Category'.
+
+```{r}
+#Convert Plane Age to categorical type with correct order
+Avg_airplanes$`Plane Age Category` <- factor(Avg_airplanes$`Plane Age Category`, levels = c('Old', 'New'), ordered = TRUE)
+Avg_airplanes <- Avg_airplanes[order(Avg_airplanes$`Plane Age Category`), ]  
+
+#Plot bar graph
+MeanAirplanes <- ggplot(data = Avg_airplanes, aes(x = `Plane Age Category`, y = `Total average delay`, fill = `Plane Age Category`)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average Delay for New and Old Planes (minutes)",
+       x = "Plane Age Category",
+       y = "Minutes") +
+  scale_fill_manual(values = c("Old" = 2, "New" = 4)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) + 
+  geom_text(aes(label = sprintf("%.2f", `Total average delay`)), vjust = -0.5, size = 3.5) +
+  ylim(0, 15.5)
+
+#Print resulting graph
+ggsave("MeanAirplanes.png", width = 10, height = 6)
+MeanAirplanes
+```
+
+The bar graph above illustrates the average delay categorised by plane age category (New/Old).
+
+We will now create a table summarising the total number of delays by 'Plane Age Category' per year.
+
+```{r}
+#Filter the data to include only years from 1995 to 2004
+airplanes_filtered <- airplanes[airplanes$Year >= 1995 & airplanes$Year <= 2004, ]
+
+#Compute the total number of delays for each year and plane age category
+DelaysPerYear <- aggregate(Delayed_Boolean ~ Year + PlaneAgeCategory, data = airplanes_filtered, FUN = sum)
+
+#Rename column header
+colnames(DelaysPerYear) <- c("Year", "PlaneAgeCategory", "Total Delays")
+
+#Print resulting table
+DelaysPerYear%>%
+  kable() %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+We will conclude our analysis on flight delays by Plane Age Category, covering the period from 1995 to 2004, with a line graph showing Plane Age Category delays across the years.
+
+```{r}
+#Plot a line graph
+PlaneAgeDelay <- ggplot(data = DelaysPerYear, aes(x = Year, y = `Total Delays`, color = PlaneAgeCategory, group = PlaneAgeCategory)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Year", y = "Number of Delays", title = "Total Number of Delays per year (1995 to 2004) by Plane Age", color = "Plane Age Category") +
+  scale_x_continuous(breaks = seq(min(DelaysPerYear$Year), max(DelaysPerYear$Year), by = 1)) +
+  scale_color_manual(values = c("Old" = 2, "New" = 4)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+#Annotate each point with its corresponding value
+PlaneAgeDelay + 
+  geom_text(aes(label = `Total Delays`), vjust = -0.5, color = "black", size = 3)
+
+#Print the resulting graph
+ggsave("PlaneAgeDelay.png", width = 10, height = 6)
+PlaneAgeDelay
+```
+
+Based on the analysis comparing flight delays between Old planes (aged 21 years and above) and New planes (aged 0 to 21 years), it can be inferred that older planes do not necessarily suffer more delays on a year-to-year basis.
+
+The line graph illustrates that New planes generally experience more delays overall. In 2004, New planes recorded the highest number of delays, exceeding two million, while in 2001, they had the lowest, approximately 110,000 delays. In contrast, Old planes exhibited their largest number of delays in 2000, with 70,946 flights, and the lowest in 2004, with 473 flights
+
+Despite operating fewer flights overall (1,211,233 flights compared to 19,366,539 flights for New planes), Old planes showed a percentage of delayed flights close to 50%, only about 10% less than New planes. This suggests that while new planes experience more delays in absolute numbers due to their higher flight volume, the percentage of delayed flights remains comparable between the two categories.
+
+Therefore, while it may be tempting to conclude that older planes suffer more delays, a deeper examination reveals that this assertion may not hold true on a year-to-year basis. Nonetheless, older planes still contribute significantly to the total number of delayed flights within their category (47.69% of delayed flights within the old planes category).
+
+
+#c. For each year, fit a logistic regression model for the probability of diverted US flights using as many features as possible from attributes of the departure date, the scheduled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualise the coefficients across years.
+```{r}
+#Display columns headers of 'planes' dataframe
+names(planes)
+```
+
+```{r}
+#Select features from the 'planes' dataframe to be used in the analysis
+PlaneFeatures <- c('Month', 'DayofMonth', 'DepTime', 'UniqueCarrier', 'DepDelay', 'Distance')
+X <- planes[, PlaneFeatures, drop = FALSE]
+y <- planes[['Diverted']]
+```
+
+```{r}
+#Split data into train and test sets
+set.seed(1) # Set seed for reproducibility
+train_indices <- sample(1:nrow(X), 0.5 * nrow(X)) 
+test_indices <- setdiff(1:nrow(X), train_indices)
+
+PlaneFeaturesX_train <- X[train_indices, ]
+PlaneFeaturesy_train <- y[train_indices]
+PlaneFeaturesX_test <- X[test_indices, ]
+PlaneFeaturesy_test <- y[test_indices]
+
+#Preprocess training data (imputation and scaling)
+Planefeatures_processed <- preProcess(PlaneFeaturesX_train, method = c("medianImpute", "center", "scale"))
+X_train_processed <- predict(Planefeatures_processed, PlaneFeaturesX_train)
+
+#Preprocess test data (imputation and scaling)
+X_test_processed <- predict(Planefeatures_processed, PlaneFeaturesX_test)
+```
+
+```{r}
+#Define numerical features
+PlaneFeatures_numerical <- c('DepTime', 'DepDelay', 'Distance')
+
+#Apply imputation and scaling on numerical features
+PlaneFeatures_numerical_transformer <- recipe(~ ., data = data.frame(X_train_processed)) %>%
+  step_impute_median(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes())
+
+#Define categorical features
+PlaneFeatures_categorical <- c('Month', 'DayofMonth', 'UniqueCarrier')
+
+#Apply imputation and create dummy variables for categorical features
+PlaneFeatures_categorical_transformer <- recipe(~ ., data = data.frame(X_train_processed)) %>%
+  step_mutate_at(vars(all_nominal()), fn = ~ ifelse(is.na(.), "missing", .)) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+#Merge both numerical and categorical transformers
+PlaneFeatures_preprocessor <- recipe(~ ., data = data.frame(X_train_processed)) %>%
+  step_mutate(DepTime = as.numeric(DepTime)) %>%
+  step_mutate(DepDelay = as.numeric(DepDelay)) %>%
+  step_mutate(Distance = as.numeric(Distance)) %>%
+  step_mutate_at(vars(DepTime, DepDelay, Distance), fn = ~ as.numeric(.)) %>%
+  step_impute_median(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+```
+
+```{r}
+#Fit logistic regression model
+PlaneFeatures_pipeLR <- glm(formula = y_train ~ ., data = as.data.frame(X_train_processed), family = "binomial")
+```
+
+```{r}
+#Convert UniqueCarrier to factor
+X_train_processed$UniqueCarrier <- as.factor(X_train_processed$UniqueCarrier)
+
+#Fit gradient boosting model
+PlaneFeatures_pipegdb <- gbm.fit(X_train_processed, y_train, distribution = "bernoulli", n.trees = 50, interaction.depth = 1)
+```
+
+Extend the analysis by incorporating results from other classification methods.
+
+```{r}
+#Fit penalised logistic regression model
+PlaneFeatures_pipeplr <- glmnet(x = as.matrix(X_train_processed), y = y_train, family = "binomial")
+```
+
+```{r}
+#Fit classification tree model
+PlaneFeatures_pipetree <- rpart(formula = y_train ~ ., data = as.data.frame(X_train_processed), method = "class")
+```
+
+```{r}
+#Predict probabilities for logistic regression, gradient boosting, penalised logistic regression, and classification tree classifiers
+y_pred_glm <- predict(PlaneFeatures_pipeLR, newdata = as.data.frame(X_test_processed), type = "response")
+
+y_pred_gbm <- predict(PlaneFeatures_pipegdb, newdata = X_test_processed, n.trees = 10, type = "response")
+
+y_pred_glmnet <- predict(PlaneFeatures_pipeplr, newx = as.matrix(X_test_processed), s = 0.01,  type = "response")
+
+y_pred_tree <- predict(PlaneFeatures_pipetree, newdata = as.data.frame(X_test_processed), type = "prob")[, 2]
+```
+
+```{r}
+#Compute ROC curve and AUC for logistic regression classifier
+roc_glm <- roc(y_test, y_pred_glm)
+auc_glm <- auc(roc_glm)
+
+#Compute ROC curve and AUC for gradient boosting classifier
+roc_gbm <- roc(y_test, y_pred_gbm)
+auc_gbm <- auc(roc_gbm)
+
+#Compute ROC curve and AUC for penalised logistic regression classifier
+roc_glmnet <- roc(y_test, y_pred_glmnet)
+auc_glmnet <- auc(roc_glmnet)
+
+#Compute ROC curve and AUC for classification tree classifier
+roc_tree <- roc(y_test, y_pred_tree)
+auc_tree <- auc(roc_tree)
+
+#Print ROC AUC scores
+print(paste("Logistic Regression ROC AUC:", auc_glm))
+print(paste("Gradient Boosting ROC AUC:", auc_gbm))
+print(paste("Penalised Logistic Regression ROC AUC:", auc_glmnet))
+print(paste("Classification Tree ROC AUC:", auc_tree))
+```
+
+```{r}
+#Plot ROC curves
+ROCLR <- plot(roc_glm, col = "blue", main = "ROC Curve: Logistic Regression", legacy.axes = TRUE, xlab = "False Positive Rate", ylab = "True Positive Rate", xlim = c(1, 0))
+lines(roc_gbm, col = "orange")
+lines(roc_tree, col = "red")
+lines(roc_glmnet, col = "green")
+
+# Calculate AUC values
+auc_values <- c(roc_glm$auc, roc_gbm$auc, roc_tree$auc, roc_glmnet$auc)
+
+# Add legend with AUC values
+legend("bottomright", legend = paste(c("Logistic Regression", "Gradient Boosting", "Classification Tree", "Penalized Logistic Regression"), "AUC =", round(auc_values, 3)),
+       col = c("blue", "orange", "red", "green"), lty = 1, cex = 0.8)
+```
+
+The ROC curve demonstrates the ability of PlaneFeatures models to predict flight diversions by balancing the correct identification of diverted flights (sensitivity) with the incorrect identification of non-diverted flights (1 - specificity) at different thresholds.
+
+In the Logistic Regression model, the AUC of 0.67 indicates a reasonable ability to distinguish diverted flights from non-diverted ones. Conversely, the Gradient Boosting, Penalised Logistic Regression and Classification Tree model yields a lower AUC value of no significant value. 
+
+Overall, this suggests that while the logistic regression model demonstrates a moderate ability to distinguish between diverted and non-diverted flights, the other models (Gradient Boosting classifier, Penalised Logistic Regression, and Classification tree) may not be as effective for this specific task. Further investigation and possibly model refinement are warranted to improve predictive performance and enhance the ability to accurately identify flight diversions.
+
+```{r}
+#Define years for analysis
+years <- c(1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004)
+
+#Initialise lists to store coefficients and AUC scores
+coefficients <- list()
+auc_scores <- list()
+
+#Function to fit logistic regression model
+LR_fit <- function(year_data) {
+  
+  #Fit logistic regression model
+  LRmodel <- glm(Diverted ~ ., data = year_data, family = "binomial")
+  
+  #Store coefficients (excluding intercept)
+  coefficients[[length(coefficients) + 1]] <- coef(LRmodel)[-1]
+  
+  #Predict probabilities
+  y_probability <- predict(LRmodel, newdata = year_data, type = "response")
+  
+  #Compute AUC
+  auc_score <- pROC::roc(year_data$Diverted, y_probability)$auc
+  
+  #Store AUC score
+  auc_scores[[length(auc_scores) + 1]] <- auc_score
+  
+  return(list(coefficients = coef(LRmodel)[-1], auc_score = auc_score))
+}
+```
+
+```{r}
+#Fit logistic regression model for each year
+for (year in years) {
+  #Filter data for specific year
+  plane_year <- get(paste0("yeardata_", year))
+  
+  #Subset data to include only necessary columns
+  plane_year <- plane_year[, c("Diverted", PlaneFeatures)]
+  
+  #Fit logistic regression model
+  resultingLR <- LR_fit(plane_year)
+  
+  #Store results
+  if (!is.null(resultingLR)) {
+    coefficients[[as.character(year)]] <- resultingLR$coefficients
+    auc_scores[[as.character(year)]] <- resultingLR$auc_score
+  }
+}
+```
+
+```{r}
+#Combine coefficients and AUC scores into a data frame
+resultingLR_df <- data.frame(
+  Year = rep(years, each = length(PlaneFeatures)),
+  Feature = rep(PlaneFeatures, times = length(years)),
+  Coefficient = unlist(lapply(coefficients, function(x) x[1:length(PlaneFeatures)])),
+  AUC_Score = unlist(auc_scores)
+)
+
+#Define the order of features
+feature_order <- c('Month', 'DayofMonth', 'DepTime', 'UniqueCarrier', 'DepDelay', 'Distance')
+
+#Define colors for each year
+year_colors <- c("1995" = "blue", "1996" = "orange", "1997" = "darkgreen", "1998" = "red",
+                 "1999" = "purple", "2000" = "brown", "2001" = "pink", "2002" = "grey",
+                 "2003" = "green", "2004" = "cyan")
+
+#Plot Logistic Regression model coefficients across years
+LRyears <- ggplot(results_df, aes(x = factor(Feature, levels = feature_order), y = Coefficient, color = as.factor(Year), group = Year)) + 
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = year_colors) +
+  labs(x = "Feature", y = "Coefficient Value",
+    title = "Logistic Regression Coefficients Across Years",
+    color = "Year") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  xlim(0,1)
+
+#Print resulting graph
+ggsave("LRyears.png", width = 10, height = 6)
+LRyears
+```
+
+The logistic regression analysis revealed insights into the influence of various attributes on the probability of diverted US flights across different years. Notably, 'UniqueCarrier' exhibited low coefficient values, indicating its minimal impact on flight diversion likelihood. Conversely, 'Distance' emerged as a significant predicator, yielding high coefficient values. 
+
+In conclusion, the logistic regression analysis underscores the critical role in influencing flight diversion probabilities, while Carrier types ('UniqueCarrier') appears to have minimal impact. These finding provide valuable insights into the factors driving flight diversion over the years. 
+
+
+#References
+Paramount Business Jets. (n.d.). Is the age of an aircraft a safety factor? [online] Available at: https://www.paramountbusinessjets.com/faq/age-of-aircraft-safety-factor#:~:text=An%20aircraft [Accessed 24 Apr. 2024].
+
